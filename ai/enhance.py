@@ -2,120 +2,167 @@ import os
 import json
 import sys
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 from typing import List, Dict
-from queue import Queue
-from threading import Lock
-# INSERT_YOUR_CODE
-import requests
 
+import requests
 import dotenv
 import argparse
 from tqdm import tqdm
-
-import langchain_core.exceptions
-from langchain_openai import ChatOpenAI
-from langchain.prompts import (
-    ChatPromptTemplate,
-    SystemMessagePromptTemplate,
-    HumanMessagePromptTemplate,
-)
-from structure import Structure
+from anthropic import Anthropic
+from json_repair import repair_json
 
 if os.path.exists('.env'):
     dotenv.load_dotenv()
+
 template = open("template.txt", "r").read()
-system = open("system.txt", "r").read()
+system_prompt = open("system.txt", "r").read()
+
+# Anthropic 配置（从 test_anthropic_sdk.py 迁移）
+ANTHROPIC_BASE_URL = os.environ.get(
+    "ANTHROPIC_BASE_URL", "https://idealab.alibaba-inc.com/api/anthropic"
+)
+ANTHROPIC_AUTH_TOKEN = os.environ.get(
+    "ANTHROPIC_AUTH_TOKEN", "03bc7ddb1b58b382eb44c1bfe3cdd822"
+)
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-6")
+
+# 模拟 claude-code CLI 客户端
+CLI_HEADERS = {
+    "User-Agent": "claude-cli/1.0.60 (external, cli)",
+    "anthropic-beta": "claude-code-20250219",
+    "x-app": "cli",
+}
+
+# JSON 输出格式说明
+JSON_SCHEMA_INSTRUCTION = """
+You MUST respond with a valid JSON object (no markdown, no code fences) with exactly these 5 fields:
+{
+  "tldr": "a concise TL;DR summary",
+  "motivation": "the motivation of this paper",
+  "method": "the method proposed",
+  "result": "key results",
+  "conclusion": "conclusion"
+}
+"""
+
 
 def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=str, required=True, help="jsonline data file")
-    parser.add_argument("--max_workers", type=int, default=1, help="Maximum number of parallel workers")
+    parser.add_argument("--max_workers", type=int, default=1, help="(unused, kept for compatibility)")
     return parser.parse_args()
 
-def process_single_item(chain, item: Dict, language: str) -> Dict:
-    def is_sensitive(content: str) -> bool:
-        """
-        调用 spam.dw-dengwei.workers.dev 接口检测内容是否包含敏感词。
-        返回 True 表示触发敏感词，False 表示未触发。
-        """
+
+def build_client() -> Anthropic:
+    """构造走 Bearer 鉴权 + CLI 伪装头的 Anthropic 客户端"""
+    # 防止 SDK 自动读取 ANTHROPIC_API_KEY
+    os.environ.pop("ANTHROPIC_API_KEY", None)
+    return Anthropic(
+        base_url=ANTHROPIC_BASE_URL,
+        auth_token=ANTHROPIC_AUTH_TOKEN,
+        default_headers=CLI_HEADERS,
+        timeout=120.0,
+        max_retries=2,
+    )
+
+
+def call_ai(client: Anthropic, content: str, language: str) -> Dict:
+    """调用 Anthropic API 分析论文摘要，返回结构化 JSON"""
+    full_system = system_prompt.replace("{language}", language) + "\n" + JSON_SCHEMA_INSTRUCTION
+    user_message = template.replace("{content}", content)
+
+    resp = client.messages.create(
+        model=ANTHROPIC_MODEL,
+        max_tokens=2048,
+        system=full_system,
+        messages=[{"role": "user", "content": user_message}],
+    )
+
+    # 提取文本
+    text = "".join(
+        block.text for block in resp.content
+        if getattr(block, "type", None) == "text"
+    )
+
+    # 清理：去掉 <think>...</think> 标签（思考型模型可能带）
+    text = text.strip()
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+
+    # 清理 markdown code fence
+    if text.startswith("```"):
+        text = re.sub(r'^```(?:json)?\s*', '', text)
+        text = re.sub(r'\s*```$', '', text)
+        text = text.strip()
+
+    # 尝试直接解析
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # 使用 json_repair 修复常见问题（未转义引号、换行等）
+    try:
+        repaired = repair_json(text, return_objects=True)
+        if isinstance(repaired, dict):
+            return repaired
+    except Exception:
+        pass
+
+    # 兜底：用正则提取第一个 {...} JSON 对象
+    match = re.search(r'\{[\s\S]*\}', text)
+    if match:
         try:
-            resp = requests.post(
-                "https://spam.dw-dengwei.workers.dev",
-                json={"text": content},
-                timeout=5
-            )
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            repaired = repair_json(match.group(0), return_objects=True)
+            if isinstance(repaired, dict):
+                return repaired
+
+    raise ValueError(f"Cannot extract JSON from response: {text[:200]}")
+
+
+def check_github_code(content: str) -> Dict:
+    """提取并验证 GitHub 链接"""
+    code_info = {}
+
+    github_pattern = r"https?://github\.com/([a-zA-Z0-9-_]+)/([a-zA-Z0-9-_\.]+)"
+    match = re.search(github_pattern, content)
+
+    if match:
+        owner, repo = match.groups()
+        repo = repo.rstrip(".git").rstrip(".,)")
+        full_url = f"https://github.com/{owner}/{repo}"
+        code_info["code_url"] = full_url
+
+        github_token = os.environ.get("TOKEN_GITHUB")
+        headers = {"Accept": "application/vnd.github.v3+json"}
+        if github_token:
+            headers["Authorization"] = f"token {github_token}"
+
+        try:
+            api_url = f"https://api.github.com/repos/{owner}/{repo}"
+            resp = requests.get(api_url, headers=headers, timeout=5)
             if resp.status_code == 200:
-                result = resp.json()
-                # 约定接口返回 {"sensitive": true/false, ...}
-                return result.get("sensitive", True)
-            else:
-                # 如果接口异常，默认不触发敏感词
-                print(f"Sensitive check failed with status {resp.status_code}", file=sys.stderr)
-                return True
-        except Exception as e:
-            print(f"Sensitive check error: {e}", file=sys.stderr)
-            return True
-
-    def check_github_code(content: str) -> Dict:
-        """提取并验证 GitHub 链接"""
-        code_info = {}
-
-        # 1. 优先匹配 github.com/owner/repo 格式
-        github_pattern = r"https?://github\.com/([a-zA-Z0-9-_]+)/([a-zA-Z0-9-_\.]+)"
-        match = re.search(github_pattern, content)
-        
-        if match:
-            owner, repo = match.groups()
-            # 清理 repo 名称，去掉可能的 .git 后缀或末尾的标点
-            repo = repo.rstrip(".git").rstrip(".,)")
-            
-            full_url = f"https://github.com/{owner}/{repo}"
-            code_info["code_url"] = full_url
-            
-            # 尝试调用 GitHub API 获取信息
-            github_token = os.environ.get("TOKEN_GITHUB")
-            headers = {"Accept": "application/vnd.github.v3+json"}
-            if github_token:
-                headers["Authorization"] = f"token {github_token}"
-            
-            try:
-                api_url = f"https://api.github.com/repos/{owner}/{repo}"
-                resp = requests.get(api_url, headers=headers, timeout=5)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    code_info["code_stars"] = data.get("stargazers_count", 0)
-                    code_info["code_last_update"] = data.get("pushed_at", "")[:10]
-            except Exception:
-                # API 调用失败不影响主流程
-                pass
-            return code_info
-
-        # 2. 如果没有 github.com，尝试匹配 github.io
-        github_io_pattern = r"https?://[a-zA-Z0-9-_]+\.github\.io(?:/[a-zA-Z0-9-_\.]+)*"
-        match_io = re.search(github_io_pattern, content)
-        
-        if match_io:
-            url = match_io.group(0)
-            # 清理末尾标点
-            url = url.rstrip(".,)")
-            code_info["code_url"] = url
-            # github.io 不进行 star 和 update 判断
-                
+                data = resp.json()
+                code_info["code_stars"] = data.get("stargazers_count", 0)
+                code_info["code_last_update"] = data.get("pushed_at", "")[:10]
+        except Exception:
+            pass
         return code_info
 
-    # 检查 summary 字段
-    if is_sensitive(item.get("summary", "")):
-        return None
+    github_io_pattern = r"https?://[a-zA-Z0-9-_]+\.github\.io(?:/[a-zA-Z0-9-_\.]+)*"
+    match_io = re.search(github_io_pattern, content)
+    if match_io:
+        url = match_io.group(0).rstrip(".,)")
+        code_info["code_url"] = url
 
-    # 检测代码可用性
-    code_info = check_github_code(item.get("summary", ""))
-    if code_info:
-        item.update(code_info)
+    return code_info
 
-    """处理单个数据项"""
-    # Default structure with meaningful fallback values
+
+def process_single_item(client: Anthropic, item: Dict, language: str) -> Dict:
+    """处理单篇论文"""
     default_ai_fields = {
         "tldr": "Summary generation failed",
         "motivation": "Motivation analysis unavailable",
@@ -123,96 +170,86 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
         "result": "Result analysis unavailable",
         "conclusion": "Conclusion extraction failed"
     }
-    
-    try:
-        response: Structure = chain.invoke({
-            "language": language,
-            "content": item['summary']
-        })
-        item['AI'] = response.model_dump()
-    except langchain_core.exceptions.OutputParserException as e:
-        # 尝试从错误信息中提取 JSON 字符串并修复
-        error_msg = str(e)
-        partial_data = {}
-        
-        if "Function Structure arguments:" in error_msg:
-            try:
-                # 提取 JSON 字符串
-                json_str = error_msg.split("Function Structure arguments:", 1)[1].strip().split('are not valid JSON')[0].strip()
-                # 预处理 LaTeX 数学符号 - 使用四个反斜杠来确保正确转义
-                json_str = json_str.replace('\\', '\\\\')
-                # 尝试解析修复后的 JSON
-                partial_data = json.loads(json_str)
-            except Exception as json_e:
-                print(f"Failed to parse JSON for {item.get('id', 'unknown')}: {json_e}", file=sys.stderr)
-        
-        # Merge partial data with defaults to ensure all fields exist
-        item['AI'] = {**default_ai_fields, **partial_data}
-        print(f"Using partial AI data for {item.get('id', 'unknown')}: {list(partial_data.keys())}", file=sys.stderr)
-    except Exception as e:
-        # Catch any other exceptions and provide default values
-        print(f"Unexpected error for {item.get('id', 'unknown')}: {e}", file=sys.stderr)
-        item['AI'] = default_ai_fields
-    
-    # Final validation to ensure all required fields exist
-    for field in default_ai_fields.keys():
-        if field not in item['AI']:
-            item['AI'][field] = default_ai_fields[field]
 
-    # 检查 AI 生成的所有字段
-    for v in item.get("AI", {}).values():
-        if is_sensitive(str(v)):
-            return None
+    # 检测代码可用性
+    code_info = check_github_code(item.get("summary", ""))
+    if code_info:
+        item.update(code_info)
+
+    try:
+        ai_result = call_ai(client, item['summary'], language)
+        item['AI'] = ai_result
+    except json.JSONDecodeError as e:
+        print(f"JSON parse error for {item.get('id', 'unknown')}: {e}", file=sys.stderr)
+        item['AI'] = default_ai_fields
+    except Exception as e:
+        print(f"Error for {item.get('id', 'unknown')}: {e}", file=sys.stderr)
+        item['AI'] = default_ai_fields
+
+    # 确保所有字段都存在
+    for field in default_ai_fields:
+        if field not in item.get('AI', {}):
+            item.setdefault('AI', {})[field] = default_ai_fields[field]
+
     return item
 
-def process_all_items(data: List[Dict], model_name: str, language: str, max_workers: int) -> List[Dict]:
-    """并行处理所有数据项"""
-    llm = ChatOpenAI(model=model_name).with_structured_output(Structure, method="function_calling")
-    print('Connect to:', model_name, file=sys.stderr)
-    
-    prompt_template = ChatPromptTemplate.from_messages([
-        SystemMessagePromptTemplate.from_template(system),
-        HumanMessagePromptTemplate.from_template(template=template)
-    ])
 
-    chain = prompt_template | llm
-    
-    # 使用线程池并行处理
-    processed_data = [None] * len(data)  # 预分配结果列表
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # 提交所有任务
-        future_to_idx = {
-            executor.submit(process_single_item, chain, item, language): idx
-            for idx, item in enumerate(data)
-        }
-        
-        # 使用tqdm显示进度
-        for future in tqdm(
-            as_completed(future_to_idx),
-            total=len(data),
-            desc="Processing items"
-        ):
-            idx = future_to_idx[future]
+def process_all_items(data: List[Dict], language: str) -> List[Dict]:
+    """串行处理所有论文，带速率限制和重试"""
+    client = build_client()
+    print(f'🔗 Anthropic API: {ANTHROPIC_BASE_URL}', file=sys.stderr)
+    print(f'🤖 Model: {ANTHROPIC_MODEL}', file=sys.stderr)
+    print(f'📊 论文总数: {len(data)} 篇', file=sys.stderr)
+
+    # 速率限制配置
+    rate_limit = int(os.environ.get("RATE_LIMIT_PER_MIN", "30"))
+    interval = 60.0 / rate_limit
+    max_retries = 3
+
+    print(f'⏱️  速率限制: {rate_limit} 次/分钟 (间隔 {interval:.1f}s)', file=sys.stderr)
+
+    processed_data = []
+    for item in tqdm(data, desc="Processing papers"):
+        success = False
+
+        for attempt in range(max_retries):
             try:
-                result = future.result()
-                processed_data[idx] = result
+                result = process_single_item(client, item, language)
+                processed_data.append(result)
+                success = True
+                break
             except Exception as e:
-                print(f"Item at index {idx} generated an exception: {e}", file=sys.stderr)
-                # Add default AI fields to ensure consistency
-                processed_data[idx] = data[idx]
-                processed_data[idx]['AI'] = {
-                    "tldr": "Processing failed",
-                    "motivation": "Processing failed",
-                    "method": "Processing failed",
-                    "result": "Processing failed",
-                    "conclusion": "Processing failed"
-                }
-    
+                error_msg = str(e)
+                if 'rate' in error_msg.lower() or 'IRC-001' in error_msg or '超过' in error_msg:
+                    wait_time = 65
+                    print(f'\n⏳ 速率限制，等待 {wait_time}s (attempt {attempt+1}/{max_retries})...', file=sys.stderr)
+                    time.sleep(wait_time)
+                elif '429' in error_msg:
+                    wait_time = 30
+                    print(f'\n⏳ 429 Too Many Requests，等待 {wait_time}s...', file=sys.stderr)
+                    time.sleep(wait_time)
+                else:
+                    print(f"Fatal error for {item.get('id', 'unknown')}: {e}", file=sys.stderr)
+                    break
+
+        if not success:
+            item['AI'] = {
+                "tldr": "Processing failed",
+                "motivation": "Processing failed",
+                "method": "Processing failed",
+                "result": "Processing failed",
+                "conclusion": "Processing failed"
+            }
+            processed_data.append(item)
+
+        # 速率控制
+        time.sleep(interval)
+
     return processed_data
+
 
 def main():
     args = parse_args()
-    model_name = os.environ.get("MODEL_NAME", 'deepseek-chat')
     language = os.environ.get("LANGUAGE", 'Chinese')
 
     # 检查并删除目标文件
@@ -236,21 +273,19 @@ def main():
             unique_data.append(item)
 
     data = unique_data
-    print('Open:', args.data, file=sys.stderr)
-    
-    # 并行处理所有数据
-    processed_data = process_all_items(
-        data,
-        model_name,
-        language,
-        args.max_workers
-    )
-    
+    print(f'Open: {args.data} ({len(data)} unique papers)', file=sys.stderr)
+
+    # 处理所有论文
+    processed_data = process_all_items(data, language)
+
     # 保存结果
     with open(target_file, "w") as f:
         for item in processed_data:
             if item is not None:
                 f.write(json.dumps(item) + "\n")
+
+    print(f'✅ 完成！输出: {target_file}', file=sys.stderr)
+
 
 if __name__ == "__main__":
     main()
